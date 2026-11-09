@@ -1,4 +1,4 @@
-"""Celery gevent worker blocks the whole gevent hub while reconnecting to the broker.
+"""Celery gevent worker blocks the whole gevent hub while retrying the broker connection.
 
 ``celery worker -P gevent`` imports the celery package and only then calls
 ``gevent.monkey.patch_all()``. While gevent patches ``threading`` it scans
@@ -8,8 +8,12 @@ patched. ``kombu.utils.functional`` keeps the original ``time.sleep``, so
 ``retry_over_time()`` freezes every greenlet, running tasks included, for
 2, 4, 6, ... seconds while the broker is unreachable.
 
+By default no broker is needed: the worker points at a closed local port and
+stays in its connection retry loop. ``--broker-stop`` instead starts RabbitMQ in
+Docker and stops it while a task is running.
+
 Usage:
-    uv run python main.py [--workaround] [--outage SECONDS]
+    uv run python main.py [--workaround] [--seconds N] [--broker-stop]
 """
 
 import argparse
@@ -22,11 +26,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from typing import Any
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger: logging.Logger = logging.getLogger(__name__)
 
+# Nothing listens on port 1, so every connection attempt is refused immediately.
+CLOSED_BROKER_URL: str = "amqp://guest:guest@127.0.0.1:1//"
 RABBITMQ_CONTAINER: str = "celery-kombu-sleep-rabbitmq"
 RABBITMQ_IMAGE: str = "rabbitmq:3.13.7"
 RABBITMQ_PORT: int = int(os.environ.get("RABBITMQ_PORT", "5679"))
@@ -93,17 +100,18 @@ def stop_rabbitmq() -> None:
     _run(["docker", "rm", "-fv", RABBITMQ_CONTAINER], check=False)
 
 
-def start_worker(workaround: bool) -> subprocess.Popen[bytes]:
+def start_worker(workaround: bool, broker_url: str) -> subprocess.Popen[bytes]:
     """Starts a Celery gevent worker as a subprocess.
 
     Args:
         workaround: If True, let gevent patch everything before celery is imported.
+        broker_url: Broker URL handed to ``tasks.py``.
 
     Returns:
         subprocess.Popen[bytes]: The worker process handle.
     """
     launcher: list[str] = ["-m", "gevent.monkey", "--module", "celery"] if workaround else ["-m", "celery"]
-    env: dict[str, str] = {**os.environ, "RABBITMQ_PORT": str(RABBITMQ_PORT), "TICK_FILE": TICK_FILE}
+    env: dict[str, str] = {**os.environ, "BROKER_URL": broker_url, "TICK_FILE": TICK_FILE}
     with open(WORKER_LOG, "w") as log:
         return subprocess.Popen(
             [sys.executable, *launcher, "-A", "tasks", "worker", "-P", "gevent", "-c", "4", "--loglevel=warning"],
@@ -128,101 +136,114 @@ def stop_worker(proc: subprocess.Popen[bytes]) -> None:
         proc.wait()
 
 
-def wait_for_file(path: str, proc: subprocess.Popen[bytes], timeout: float = 60) -> None:
-    """Waits until ``path`` exists and is non-empty.
+def read_ticks() -> list[dict[str, Any]]:
+    """Reads the tick records written inside the worker.
+
+    Returns:
+        list[dict[str, Any]]: One ``{"tag", "wall", "gap"}`` record per 0.5 s step.
+    """
+    if not os.path.exists(TICK_FILE):
+        return []
+    with open(TICK_FILE) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def wait_until(ready: Callable[[], bool], proc: subprocess.Popen[bytes], what: str, timeout: float = 60) -> None:
+    """Polls ``ready`` until it returns True.
 
     Args:
-        path: File to wait for.
+        ready: Condition to wait for.
         proc: Worker process; its exit aborts the wait.
+        what: Description used in the error message.
         timeout: Seconds before giving up.
 
     Raises:
-        RuntimeError: If the worker exits or the file does not appear in time.
+        RuntimeError: If the worker exits or the condition is not met in time.
     """
     deadline: float = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise RuntimeError(f"Worker exited with {proc.returncode}, see {WORKER_LOG}")
-        if os.path.exists(path) and os.path.getsize(path) > 0:
+        if ready():
             return
         time.sleep(0.2)
-    raise RuntimeError(f"Timed out waiting for {path}, see {WORKER_LOG}")
-
-
-def read_ticks() -> list[dict[str, Any]]:
-    """Reads the tick records written by the ``tick`` task.
-
-    Returns:
-        list[dict[str, Any]]: One ``{"wall", "gap"}`` record per 0.5 s step.
-    """
-    with open(TICK_FILE) as f:
-        return [json.loads(line) for line in f if line.strip()]
+    raise RuntimeError(f"Timed out waiting for {what}, see {WORKER_LOG}")
 
 
 def main() -> None:
-    """Runs the reproduction: start broker and worker, stop the broker under a running task, measure."""
+    """Runs the reproduction and prints a verdict on the last line."""
     parser: argparse.ArgumentParser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--workaround", action="store_true",
                         help="start the worker with `python -m gevent.monkey --module celery`")
-    parser.add_argument("--outage", type=float, default=16, help="seconds to keep the broker down (default 16)")
+    parser.add_argument("--seconds", type=float, default=16,
+                        help="how long the broker stays unreachable (default 16)")
+    parser.add_argument("--broker-stop", action="store_true",
+                        help="use a real RabbitMQ (Docker) and stop it while a task is running")
     args: argparse.Namespace = parser.parse_args()
 
     import celery
     import gevent
     import kombu
 
-    mode: str = "python -m gevent.monkey --module celery" if args.workaround else "python -m celery"
-    logger.info("Celery gevent worker: blocking sleep during broker reconnect")
+    launcher: str = "python -m gevent.monkey --module celery" if args.workaround else "python -m celery"
+    logger.info("Celery gevent worker: blocking sleep while retrying the broker connection")
     logger.info(f"Celery {celery.__version__}, kombu {kombu.__version__}, gevent {gevent.__version__}, "
                 f"Python {sys.version.split()[0]}")
-    logger.info(f"Worker: {mode} -A tasks worker -P gevent")
+    logger.info(f"Worker: {launcher} -A tasks worker -P gevent")
 
     for path in (TICK_FILE, STATUS_FILE):
         if os.path.exists(path):
             os.remove(path)
 
-    start_rabbitmq()
+    broker_url: str = f"amqp://guest:guest@127.0.0.1:{RABBITMQ_PORT}//" if args.broker_stop else CLOSED_BROKER_URL
+    tag: str = "task" if args.broker_stop else "hub"
+    logger.info(f"Broker: {broker_url}" + ("" if args.broker_stop else " (closed port, no broker needed)"))
+    if args.broker_stop:
+        start_rabbitmq()
     try:
-        proc: subprocess.Popen[bytes] = start_worker(args.workaround)
+        proc: subprocess.Popen[bytes] = start_worker(args.workaround, broker_url)
         try:
-            wait_for_file(STATUS_FILE, proc)
+            wait_until(lambda: os.path.exists(STATUS_FILE) and os.path.getsize(STATUS_FILE) > 0, proc, "worker init")
             with open(STATUS_FILE) as f:
                 status: dict[str, bool] = json.load(f)
-            logger.info(f"Worker ready: time patched={status['time_patched']}, "
+            logger.info(f"Worker started: time patched={status['time_patched']}, "
                         f"kombu.utils.functional.sleep is unpatched time.sleep={status['kombu_sleep_is_unpatched']}")
 
-            from tasks import tick
+            if args.broker_stop:
+                os.environ["BROKER_URL"] = broker_url
+                from tasks import tick
 
-            tick.delay(args.outage + 30)
-            wait_for_file(TICK_FILE, proc)
-            time.sleep(3)
-
-            logger.info(f"Stopping broker for {args.outage:.0f}s while the task is running...")
-            outage_start: float = time.time()
-            _run(["docker", "stop", "-t", "5", RABBITMQ_CONTAINER])
-            time.sleep(args.outage)
-            outage_end: float = time.time()
+                tick.delay(args.seconds + 30)
+                wait_until(lambda: any(t["tag"] == "task" for t in read_ticks()), proc, "the task to start")
+                time.sleep(3)
+                logger.info(f"Stopping broker for {args.seconds:.0f}s while the task is running...")
+                window_start: float = time.time()
+                _run(["docker", "stop", "-t", "5", RABBITMQ_CONTAINER])
+            else:
+                logger.info(f"Watching a 0.5s ticker greenlet for {args.seconds:.0f}s while the worker retries...")
+                window_start = time.time()
+            time.sleep(args.seconds)
+            window_end: float = time.time()
             if proc.poll() is not None:
-                raise RuntimeError(f"Worker exited during the outage, see {WORKER_LOG}")
+                raise RuntimeError(f"Worker exited during the measurement, see {WORKER_LOG}")
         finally:
             stop_worker(proc)
     finally:
-        stop_rabbitmq()
+        if args.broker_stop:
+            stop_rabbitmq()
 
-    ticks: list[dict[str, Any]] = [t for t in read_ticks() if outage_start < t["wall"] <= outage_end]
+    ticks: list[dict[str, Any]] = [t for t in read_ticks() if t["tag"] == tag and window_start < t["wall"] <= window_end]
     gaps: list[float] = [t["gap"] for t in ticks]
-    silent_at_end: float = outage_end - max((t["wall"] for t in ticks), default=outage_start)
+    silent_at_end: float = window_end - max((t["wall"] for t in ticks), default=window_start)
     with open(WORKER_LOG) as f:
         retries: list[str] = re.findall(r"Trying again in ([\d.]+) seconds", f.read())
-    logger.info(f"Worker reconnect attempts during outage: waits {', '.join(retries) or 'none'} s")
-    logger.info(f"Task tick gaps > 1.5s: {', '.join(f'{g:.1f}' for g in gaps if g > 1.5) or 'none'} "
-                f"(task silent for {silent_at_end:.1f}s when the outage window closed)")
+    logger.info(f"Worker reconnect waits: {', '.join(retries) or 'none'} s")
+    logger.info(f"{tag.capitalize()} tick gaps > 1.5s: {', '.join(f'{g:.1f}' for g in gaps if g > 1.5) or 'none'} "
+                f"({tag} silent for {silent_at_end:.1f}s when the window closed)")
 
     worst: float = max([*gaps, silent_at_end])
-    if worst > 1.5:
-        logger.info(f"Max task tick gap during broker outage: {worst:.1f}s (expected ~0.5s)  BLOCKING SLEEP CONFIRMED")
-    else:
-        logger.info(f"Max task tick gap during broker outage: {worst:.1f}s (expected ~0.5s)  NOT REPRODUCED")
+    verdict: str = "BLOCKING SLEEP CONFIRMED" if worst > 1.5 else "NOT REPRODUCED"
+    logger.info(f"Max {tag} tick gap while the broker is unreachable: {worst:.1f}s (expected ~0.5s)  {verdict}")
 
 
 if __name__ == "__main__":
