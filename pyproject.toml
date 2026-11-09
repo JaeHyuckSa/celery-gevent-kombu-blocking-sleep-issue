@@ -1,0 +1,7 @@
+[project]
+name = "celery-gevent-kombu-blocking-sleep"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "celery[gevent]>=5.4",
+]
